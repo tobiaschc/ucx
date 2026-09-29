@@ -525,6 +525,30 @@ def test_get_accessible_workspaces():
     assert len(account_workspaces.get_accessible_workspaces()) == 1
 
 
+def test_get_accessible_workspaces_restricted_to_include_workspace_ids():
+    acc = create_autospec(AccountClient)
+    acc.workspaces.list.return_value = [
+        Workspace(workspace_name="foo", workspace_id=123, workspace_status_message="Running", deployment_name="abc"),
+        Workspace(workspace_name="bar", workspace_id=456, workspace_status_message="Running", deployment_name="def"),
+    ]
+
+    ws1 = create_autospec(WorkspaceClient)
+    ws1.current_user.me.return_value = iam.User(user_name="me@example.com", groups=[iam.ComplexValue(display="admins")])
+    ws2 = create_autospec(WorkspaceClient)
+    ws2.current_user.me.return_value = iam.User(user_name="me@example.com", groups=[iam.ComplexValue(display="admins")])
+
+    def get_workspace_client(workspace) -> WorkspaceClient:
+        return ws1 if workspace.workspace_id == 123 else ws2
+
+    acc.get_workspace_client.side_effect = get_workspace_client
+
+    # both workspaces are admin-accessible, but only 456 is in scope
+    account_workspaces = AccountWorkspaces(acc, include_workspace_ids=[456])
+    accessible = account_workspaces.get_accessible_workspaces()
+
+    assert [w.workspace_id for w in accessible] == [456]
+
+
 def test_account_workspaces_can_administer_when_user_in_admins_group() -> None:
     acc = create_autospec(AccountClient)
     ws = create_autospec(WorkspaceClient)

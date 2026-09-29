@@ -189,11 +189,12 @@ class AccountWorkspaces:
 
     def get_accessible_workspaces(self) -> list[Workspace]:
         """
-        Get all workspaces that the user has access to
+        Get all workspaces that the user has access to, restricted to
+        `include_workspace_ids` (passed to the constructor) when set.
         :return: list[Workspace]
         """
         accessible_workspaces = []
-        for workspace in self._ac.workspaces.list():
+        for workspace in self._workspaces():
             if self.can_administer(workspace):
                 accessible_workspaces.append(workspace)
         return accessible_workspaces
