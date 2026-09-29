@@ -302,6 +302,26 @@ This installation mode will automatically select the following options:
 * Automatically create and enable HMS lineage init script
 * Automatically create a new SQL warehouse for UCX assessment
 
+#### Optional environment variables for scripted installs
+
+These are opt-in; when unset, installation behaves exactly as described above.
+
+| Variable | Applies to | Effect |
+|---|---|---|
+| `UCX_INSTALL_CONFIG_PATH=<file>` | workspace and account install | Loads the `WorkspaceConfig` from a YAML/JSON file instead of asking the new-installation questions. In account mode, the same config is used for every workspace without asking whether to reuse it. The workspace confirmation prompt still appears. |
+| `UCX_WAREHOUSE_NAME=<name>` | workspace and account install | Reuses the existing SQL warehouse with this exact name instead of creating one (account mode) or asking (workspace mode). Installation fails if the name matches zero or more than one warehouse. In account mode this is checked on every workspace **before** anything is installed. |
+| `UCX_SKIP_HMS_LINEAGE=true` | workspace and account install | Does not create or enable the HMS lineage global init script. Accepts `1`, `true`, `yes`, `on`. |
+| `UCX_ACCOUNT_WORKSPACE_IDS=<id>,<id>` | account install | Restricts `UCX_FORCE_INSTALL=account` to the listed workspace ids instead of every workspace you administer. Installation fails before anything is installed if any listed id doesn't exist in the account or you aren't a workspace admin on it. |
+
+```shell
+UCX_FORCE_INSTALL=account \
+UCX_ACCOUNT_WORKSPACE_IDS=1234567890,2345678901 \
+UCX_INSTALL_CONFIG_PATH=./ucx-config.yml \
+UCX_WAREHOUSE_NAME="Shared SQL" \
+UCX_SKIP_HMS_LINEAGE=true \
+databricks labs install ucx
+```
+
 
 
 ### Installing UCX with company hosted PYPI mirror

@@ -146,6 +146,37 @@ def extract_major_minor(version_string):
     return None
 
 
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_flag(environ: dict[str, str], name: str) -> bool:
+    """Return True if the environment variable is set to a truthy value (1/true/yes/on, case-insensitive)."""
+    return environ.get(name, "").strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def load_install_config_override(environ: dict[str, str]) -> WorkspaceConfig | None:
+    """Load a WorkspaceConfig from the file referenced by `UCX_INSTALL_CONFIG_PATH`, if set.
+
+    Used by both the single-workspace install and the account-level install
+    (`UCX_FORCE_INSTALL=account`) to replace the new-installation questionnaire
+    with a reviewable, version-controlled config file. Uses the same
+    `Installation.load_local()` deserializer UCX uses elsewhere, so config
+    version migrations apply and malformed files fail with a clear message.
+
+    This only replaces the questionnaire in `_prompt_for_new_installation`. Other
+    prompts (e.g. the account-level workspace confirmation, warehouse selection
+    unless `UCX_WAREHOUSE_NAME` is set) still apply.
+    """
+    config_path = environ.get("UCX_INSTALL_CONFIG_PATH")
+    if not config_path:
+        return None
+    logger.info(f"UCX_INSTALL_CONFIG_PATH set: loading install config from {config_path}")
+    try:
+        return Installation.load_local(WorkspaceConfig, Path(config_path))
+    except (SerdeError, FileNotFoundError, ValueError) as e:
+        raise SystemExit(f"UCX_INSTALL_CONFIG_PATH: failed to load config from {config_path}: {e}") from e
+
+
 class WorkspaceInstaller(WorkspaceContext):
     def __init__(
         self,
@@ -160,6 +191,8 @@ class WorkspaceInstaller(WorkspaceContext):
             msg = "WorkspaceInstaller is not supposed to be executed in Databricks Runtime"
             raise SystemExit(msg)
 
+        self._skip_hms_lineage = _env_flag(environ, "UCX_SKIP_HMS_LINEAGE")
+        self._warehouse_name = environ.get("UCX_WAREHOUSE_NAME")
         self._is_account_install = self._force_install == "account"
         self._workflows = Workflows.all()
 
@@ -353,7 +386,9 @@ class WorkspaceInstaller(WorkspaceContext):
     def _configure_new_installation(self, default_config: WorkspaceConfig | None = None) -> WorkspaceConfig:
         if default_config is None:
             default_config = self._prompt_for_new_installation()
-        HiveMetastoreLineageEnabler(self.workspace_client).apply(self.prompts, self._is_account_install)
+        HiveMetastoreLineageEnabler(self.workspace_client, skip=self._skip_hms_lineage).apply(
+            self.prompts, self._is_account_install
+        )
         self._check_inventory_database_exists(default_config.inventory_database)
         warehouse_id = self.configure_warehouse()
         policy_id, instance_profile, spark_conf_dict, instance_pool_id = self.policy_installer.create(
@@ -428,9 +463,26 @@ class WorkspaceInstaller(WorkspaceContext):
             return [x.strip() for x in selected_databases.split(",")]
         return None
 
+    def find_warehouse_ids_by_name(self, name: str) -> list[str]:
+        """Return the ids of all SQL warehouses in this workspace with exactly this name."""
+        return [w.id for w in self.workspace_client.warehouses.list() if w.name == name and w.id]
+
+    def _resolve_named_warehouse(self, name: str) -> str:
+        matches = self.find_warehouse_ids_by_name(name)
+        if len(matches) != 1:
+            problem = "no warehouse" if not matches else f"{len(matches)} warehouses ({', '.join(matches)})"
+            raise SystemExit(
+                f"UCX_WAREHOUSE_NAME={name}: expected exactly one warehouse with that name, found {problem}"
+            )
+        logger.info(f"UCX_WAREHOUSE_NAME set: reusing existing warehouse '{name}' ({matches[0]})")
+        return matches[0]
+
     def configure_warehouse(self) -> str:
         def warehouse_type(_):
             return _.warehouse_type.value if not _.enable_serverless_compute else "SERVERLESS"
+
+        if self._warehouse_name:
+            return self._resolve_named_warehouse(self._warehouse_name)
 
         pro_warehouses = {"[Create new PRO SQL warehouse]": "create_new"} | {
             f"{_.name} ({_.id}, {warehouse_type(_)}, {_.state.value})": _.id
@@ -785,15 +837,61 @@ class AccountInstaller(AccountContext):
         self.replace(account_client=acct_client)
         return self.account_client
 
+    @cached_property
+    def environ(self) -> dict[str, str]:
+        return dict(os.environ.items())
+
     def _get_installer(self, workspace: Workspace) -> WorkspaceInstaller:
         workspace_client = self.account_client.get_workspace_client(workspace)
-        return WorkspaceInstaller(workspace_client).replace(product_info=self.product_info, prompts=self.prompts)
+        return WorkspaceInstaller(workspace_client, self.environ).replace(
+            product_info=self.product_info, prompts=self.prompts
+        )
+
+    def _preflight_warehouse_name(self, workspaces: list[Workspace]) -> None:
+        """Fail before installing anything if `UCX_WAREHOUSE_NAME` doesn't resolve on every workspace.
+
+        Without this, a missing warehouse on workspace N aborts the loop after workspaces 1..N-1
+        were already installed, leaving a partial rollout with no recorded collection.
+        """
+        name = self.environ.get("UCX_WAREHOUSE_NAME")
+        if not name:
+            return
+        problems = []
+        for workspace in workspaces:
+            matches = self._get_installer(workspace).find_warehouse_ids_by_name(name)
+            if len(matches) != 1:
+                problems.append(f"{workspace.deployment_name}: {len(matches)} warehouses named '{name}'")
+        if problems:
+            details = "\n".join(problems)
+            raise SystemExit(f"UCX_WAREHOUSE_NAME must match exactly one warehouse per workspace:\n{details}")
+
+    def _preflight_requested_workspace_ids(self, accessible_workspaces: list[Workspace]) -> None:
+        """Fail before installing anything if an explicitly requested workspace id can't be installed.
+
+        Without this, ids that don't exist in the account or that the user can't administer are
+        silently skipped, and the install covers fewer workspaces than requested.
+        """
+        requested = set(self.workspace_ids)
+        if not requested:
+            return
+        missing = requested - {w.workspace_id for w in accessible_workspaces}
+        if not missing:
+            return
+        in_account = {w.workspace_id for w in self.account_client.workspaces.list()}
+        problems = []
+        for workspace_id in sorted(missing):
+            reason = "not a workspace admin or no access" if workspace_id in in_account else "not found in account"
+            problems.append(f"{workspace_id}: {reason}")
+        details = "\n".join(problems)
+        raise SystemExit(f"Requested workspace ids cannot be installed:\n{details}")
 
     def install_on_account(self):
         ctx = AccountContext(self._get_safe_account_client())
-        default_config = None
-        confirmed = False
+        default_config = load_install_config_override(self.environ)
+        confirmed = default_config is not None
         accessible_workspaces = self.account_workspaces.get_accessible_workspaces()
+        self._preflight_requested_workspace_ids(accessible_workspaces)
+        self._preflight_warehouse_name(accessible_workspaces)
         msg = "\n".join([w.deployment_name for w in accessible_workspaces])
         installed_workspaces = []
         if not self.prompts.confirm(
@@ -953,12 +1051,19 @@ if __name__ == "__main__":
         logging.getLogger('databricks').setLevel(logging.DEBUG)
     env = dict(os.environ.items())
     force_install = env.get("UCX_FORCE_INSTALL")
-    account_installer = AccountInstaller(AccountClient(product="ucx", product_version=__version__))
+    account_named_parameters = {}
+    if env.get("UCX_ACCOUNT_WORKSPACE_IDS"):
+        # Restrict the account-level install to these workspace ids, via the same
+        # `workspace_ids` named parameter the account-level CLI commands use.
+        account_named_parameters["workspace_ids"] = env["UCX_ACCOUNT_WORKSPACE_IDS"]
+    account_installer = AccountInstaller(
+        AccountClient(product="ucx", product_version=__version__), account_named_parameters
+    )
     if force_install == "account":
         account_installer.install_on_account()
     else:
-        workspace_installer = WorkspaceInstaller(WorkspaceClient(product="ucx", product_version=__version__))
-        workspace_installer.run()
+        workspace_installer = WorkspaceInstaller(WorkspaceClient(product="ucx", product_version=__version__), env)
+        workspace_installer.run(load_install_config_override(env))
 
         try:
             current_workspace_id = workspace_installer.workspace_client.get_workspace_id()

@@ -151,3 +151,15 @@ def test_get_script_fails_missing_script(caplog):
         hmle = HiveMetastoreLineageEnabler(ws)
         hmle.apply(MockPrompts({r'No HMS lineage collection init script exists.*': 'yes'}))
         assert "Failed to get init script 12345: INVALID_PARAMETER_VALUE" in caplog.messages
+
+
+def test_skip_hms_lineage_skips_entirely(caplog):
+    ws = create_autospec(WorkspaceClient)
+
+    hmle = HiveMetastoreLineageEnabler(ws, skip=True)
+    with caplog.at_level('INFO'):
+        hmle.apply(MockPrompts({}))
+
+    ws.global_init_scripts.list.assert_not_called()
+    ws.global_init_scripts.create.assert_not_called()
+    assert any("UCX_SKIP_HMS_LINEAGE set" in message for message in caplog.messages)

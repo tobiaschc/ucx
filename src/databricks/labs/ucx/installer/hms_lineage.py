@@ -23,10 +23,14 @@ logger = logging.getLogger(__name__)
 
 
 class HiveMetastoreLineageEnabler:
-    def __init__(self, ws: WorkspaceClient):
+    def __init__(self, ws: WorkspaceClient, skip: bool = False):
         self._ws = ws
+        self._skip = skip
 
     def apply(self, prompts: Prompts, is_account_install: bool = False):
+        if self._skip:
+            logger.info("UCX_SKIP_HMS_LINEAGE set: skipping HMS lineage global init script creation/enabling")
+            return
         script = self._check_lineage_spark_config_exists()
         if script:
             if script.enabled:

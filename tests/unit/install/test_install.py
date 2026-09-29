@@ -36,7 +36,13 @@ import databricks.labs.ucx.uninstall  # noqa
 from databricks.labs.ucx.config import WorkspaceConfig
 from databricks.labs.ucx.contexts.workflow_task import RuntimeContext
 from databricks.labs.ucx.framework.tasks import Workflow, job_task
-from databricks.labs.ucx.install import AccountInstaller, WorkspaceInstallation, WorkspaceInstaller, extract_major_minor
+from databricks.labs.ucx.install import (
+    AccountInstaller,
+    WorkspaceInstallation,
+    WorkspaceInstaller,
+    extract_major_minor,
+    load_install_config_override,
+)
 from databricks.labs.ucx.installer.workflows import DeployedWorkflows, WorkflowsDeployment
 from databricks.labs.ucx.runtime import Workflows
 
@@ -1672,6 +1678,128 @@ def test_account_installer(ws):
     assert ws.workspace.upload.call_count == 4
 
 
+def test_configure_warehouse_reuse_warehouse_name_env_var(ws):
+    ws.warehouses.list = lambda **_: [sql.EndpointInfo(name="abc", id="abc-id")]
+    install = WorkspaceInstaller(ws, {"UCX_WAREHOUSE_NAME": "abc"}).replace(prompts=MockPrompts({}))
+
+    warehouse_id = install.configure_warehouse()
+
+    assert warehouse_id == "abc-id"
+    ws.warehouses.create.assert_not_called()
+
+
+def test_configure_warehouse_reuse_warehouse_name_ambiguous(ws):
+    ws.warehouses.list = lambda **_: [sql.EndpointInfo(name="abc", id="1"), sql.EndpointInfo(name="abc", id="2")]
+    install = WorkspaceInstaller(ws, {"UCX_WAREHOUSE_NAME": "abc"}).replace(prompts=MockPrompts({}))
+
+    with pytest.raises(SystemExit, match="found 2 warehouses"):
+        install.configure_warehouse()
+    ws.warehouses.create.assert_not_called()
+
+
+def test_account_installer_scoped_to_workspace_ids(ws):
+    acc = create_autospec(AccountClient)
+    acc.workspaces.list.return_value = [
+        Workspace(workspace_id=123, deployment_name="test"),
+        Workspace(workspace_id=456, deployment_name="test2"),
+    ]
+    acc.get_workspace_client.return_value = ws
+
+    account_installer = AccountInstaller(acc, {"workspace_ids": "456"})
+    account_installer.replace(
+        prompts=MockPrompts(
+            {
+                r"UCX has detected the following workspaces*": "Yes",
+                r".*PRO or SERVERLESS SQL warehouse.*": "1",
+                r"Choose how to map the workspace groups.*": "0",
+                r"Do you want to install UCX on the remaining*": "Yes",
+                r"If hive_metastore contains managed table with external.*": "0",
+                r".*": "",
+            }
+        ),
+        product_info=ProductInfo.for_testing(WorkspaceConfig),
+        environ={},
+    )
+    account_installer.install_on_account()
+
+    requested_ids = {call.args[0].workspace_id for call in acc.get_workspace_client.call_args_list}
+    assert requested_ids == {456}
+
+
+def test_account_installer_warehouse_name_preflight_fails_before_installing(ws):
+    acc = create_autospec(AccountClient)
+    acc.workspaces.list.return_value = [
+        Workspace(workspace_id=123, deployment_name="has-warehouse"),
+        Workspace(workspace_id=456, deployment_name="missing-warehouse"),
+    ]
+    ws_ok = create_autospec(WorkspaceClient)
+    ws_ok.current_user.me.return_value = iam.User(user_name="me@example.com", groups=[ComplexValue(display="admins")])
+    ws_ok.warehouses.list.return_value = [sql.EndpointInfo(name="shared", id="w1")]
+    ws_missing = create_autospec(WorkspaceClient)
+    ws_missing.current_user.me.return_value = ws_ok.current_user.me.return_value
+    ws_missing.warehouses.list.return_value = []
+    acc.get_workspace_client.side_effect = lambda w: ws_ok if w.workspace_id == 123 else ws_missing
+
+    account_installer = AccountInstaller(acc).replace(
+        prompts=MockPrompts({r".*": "Yes"}),
+        product_info=ProductInfo.for_testing(WorkspaceConfig),
+        environ={"UCX_WAREHOUSE_NAME": "shared"},
+    )
+
+    with pytest.raises(SystemExit, match="missing-warehouse: 0 warehouses"):
+        account_installer.install_on_account()
+    ws_ok.workspace.upload.assert_not_called()
+    ws_missing.workspace.upload.assert_not_called()
+
+
+def test_configure_warehouse_reuse_warehouse_name_env_var_not_found(ws):
+    ws.warehouses.list = lambda **_: []
+    install = WorkspaceInstaller(ws, {"UCX_WAREHOUSE_NAME": "does-not-exist"}).replace(prompts=MockPrompts({}))
+
+    with pytest.raises(SystemExit, match="found no warehouse"):
+        install.configure_warehouse()
+
+
+def test_load_install_config_override_not_set():
+    assert load_install_config_override({}) is None
+
+
+def test_load_install_config_override_loads_yaml(tmp_path):
+    config_file = tmp_path / "account_config.yml"
+    config_yaml = "\n".join(
+        [
+            "inventory_database: ucx_account",
+            "ucx_catalog: ucx",
+            "connect:",
+            "  host: '...'",
+            "  token: '...'",
+            "",
+        ]
+    )
+    config_file.write_text(config_yaml)
+
+    config = load_install_config_override({"UCX_INSTALL_CONFIG_PATH": str(config_file)})
+
+    assert config is not None
+    assert config.inventory_database == "ucx_account"
+
+
+def test_load_install_config_override_missing_file_raises_clear_error(tmp_path):
+    missing_path = tmp_path / "does_not_exist.yml"
+
+    with pytest.raises(SystemExit, match="UCX_INSTALL_CONFIG_PATH"):
+        load_install_config_override({"UCX_INSTALL_CONFIG_PATH": str(missing_path)})
+
+
+def test_load_install_config_override_malformed_yaml_raises_clear_error(tmp_path):
+    config_file = tmp_path / "account_config.yml"
+    # 'unexpected_field' is not a WorkspaceConfig attribute
+    config_file.write_text("inventory_database: ucx_account\nunexpected_field: nope\n")
+
+    with pytest.raises(SystemExit, match="UCX_INSTALL_CONFIG_PATH"):
+        load_install_config_override({"UCX_INSTALL_CONFIG_PATH": str(config_file)})
+
+
 @pytest.fixture
 def mock_ws():
     def get_status(path: str):
@@ -1815,3 +1943,42 @@ def test_workspace_installer_warns_about_connection_error(caplog, no_connection_
     with pytest.raises(TimeoutError), caplog.at_level(logging.WARNING, logger="databricks.labs.ucx.source_code.jobs"):
         workspace_installer.run(default_config=default_config)
     assert "Cannot connect with" in caplog.text
+
+
+def test_workspace_installer_run_skips_new_install_prompt_with_config_override(ws):
+    """When a default_config is supplied (e.g. via UCX_INSTALL_CONFIG_PATH),
+    WorkspaceInstaller.run() must not prompt for the "new installation"
+    wizard (workspace group mapping, external HMS, etc.) since that config
+    is already known. Other independent prompts (HMS lineage, warehouse
+    choice) still fire unless also overridden via their own env vars
+    (UCX_SKIP_HMS_LINEAGE, UCX_WAREHOUSE_NAME)."""
+    ws.warehouses.list = lambda **_: [sql.EndpointInfo(name="abc", id="abc-id")]
+    workspace_installer = WorkspaceInstaller(ws, {"UCX_SKIP_HMS_LINEAGE": "1", "UCX_WAREHOUSE_NAME": "abc"}).replace(
+        prompts=MockPrompts(
+            {
+                r"If hive_metastore contains managed table with external.*": "0",
+                r".*": "",
+            }
+        ),
+        installation=MockInstallation(),
+        product_info=ProductInfo.for_testing(WorkspaceConfig),
+    )
+    default_config = WorkspaceConfig(inventory_database="ucx_single_ws")
+
+    config = workspace_installer.run(default_config=default_config)
+
+    assert config.inventory_database == "ucx_single_ws"
+    assert config.warehouse_id == "abc-id"
+    ws.global_init_scripts.create.assert_not_called()
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_skip_hms_lineage_accepts_truthy_values(ws, value):
+    installer = WorkspaceInstaller(ws, {"UCX_SKIP_HMS_LINEAGE": value})
+    assert installer._skip_hms_lineage  # pylint: disable=protected-access
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no"])
+def test_skip_hms_lineage_rejects_falsy_values(ws, value):
+    installer = WorkspaceInstaller(ws, {"UCX_SKIP_HMS_LINEAGE": value})
+    assert not installer._skip_hms_lineage  # pylint: disable=protected-access
