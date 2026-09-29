@@ -312,6 +312,7 @@ These are opt-in; when unset, installation behaves exactly as described above.
 | `UCX_WAREHOUSE_NAME=<name>` | workspace and account install | Reuses the existing SQL warehouse with this exact name instead of creating one (account mode) or asking (workspace mode). Installation fails if the name matches zero or more than one warehouse. In account mode this is checked on every workspace **before** anything is installed. |
 | `UCX_SKIP_HMS_LINEAGE=true` | workspace and account install | Does not create or enable the HMS lineage global init script. Accepts `1`, `true`, `yes`, `on`. |
 | `UCX_ACCOUNT_WORKSPACE_IDS=<id>,<id>` | account install | Restricts `UCX_FORCE_INSTALL=account` to the listed workspace ids instead of every workspace you administer. Installation fails before anything is installed if any listed id doesn't exist in the account or you aren't a workspace admin on it. |
+| `UCX_INSTALL_SCOPE=assessment` | both | Deploys only the assessment workflows (`assessment`, `assess-workflows`) and the assessment dashboards (`assessment/main`, `estimates`, `interactive`, `azure`) instead of every workflow and dashboard. Reinstalling with the scope removes previously deployed jobs and dashboards outside it. Migration commands (for example `migrate-tables`) fail with a clear error until you reinstall without the scope. The inventory schema, tables and views are always deployed. |
 
 ```shell
 UCX_FORCE_INSTALL=account \

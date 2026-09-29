@@ -154,6 +154,40 @@ def _env_flag(environ: dict[str, str], name: str) -> bool:
     return environ.get(name, "").strip().lower() in _TRUTHY_ENV_VALUES
 
 
+@dataclasses.dataclass(frozen=True)
+class InstallScope:
+    """A named subset of the workflows and dashboards UCX deploys, selected with `UCX_INSTALL_SCOPE`."""
+
+    name: str
+    workflows: frozenset[str]
+    """Workflow (job) names, as in `Workflows.all()`."""
+    dashboards: frozenset[str]
+    """Dashboard folders relative to `src/databricks/labs/ucx/queries`, as `<step>/<dashboard>`."""
+
+
+INSTALL_SCOPES = {
+    "assessment": InstallScope(
+        name="assessment",
+        # `assess-workflows` populates workflow_problems/used_tables/directfs read by the assessment main dashboard
+        workflows=frozenset({"assessment", "assess-workflows"}),
+        dashboards=frozenset({"assessment/main", "assessment/estimates", "assessment/interactive", "assessment/azure"}),
+    ),
+}
+
+
+def load_install_scope(environ: dict[str, str]) -> InstallScope | None:
+    """Return the install scope selected by `UCX_INSTALL_SCOPE`, or None to deploy everything (default)."""
+    value = environ.get("UCX_INSTALL_SCOPE", "").strip().lower()
+    if not value:
+        return None
+    scope = INSTALL_SCOPES.get(value)
+    if scope is None:
+        expected = ", ".join(sorted(INSTALL_SCOPES))
+        raise SystemExit(f"UCX_INSTALL_SCOPE: unknown scope '{value}', expected one of: {expected}")
+    logger.info(f"UCX_INSTALL_SCOPE={scope.name}: deploying only workflows {sorted(scope.workflows)}")
+    return scope
+
+
 def load_install_config_override(environ: dict[str, str]) -> WorkspaceConfig | None:
     """Load a WorkspaceConfig from the file referenced by `UCX_INSTALL_CONFIG_PATH`, if set.
 
@@ -194,7 +228,19 @@ class WorkspaceInstaller(WorkspaceContext):
         self._skip_hms_lineage = _env_flag(environ, "UCX_SKIP_HMS_LINEAGE")
         self._warehouse_name = environ.get("UCX_WAREHOUSE_NAME")
         self._is_account_install = self._force_install == "account"
-        self._workflows = Workflows.all()
+        self._install_scope = load_install_scope(environ)
+        self._workflows = self._scoped_workflows(Workflows.all(), self._install_scope)
+
+    @staticmethod
+    def _scoped_workflows(workflows: Workflows, scope: InstallScope | None) -> Workflows:
+        """Restrict the workflows to deploy to the install scope, if any.
+
+        Deploying fewer workflows also removes previously deployed ones outside the scope, because
+        `WorkflowsDeployment.create_jobs()` removes every installed job it does not (re)deploy.
+        """
+        if scope is None:
+            return workflows
+        return Workflows([workflow for name, workflow in workflows.workflows.items() if name in scope.workflows])
 
     @cached_property
     def upgrades(self) -> Upgrades:
@@ -242,6 +288,7 @@ class WorkspaceInstaller(WorkspaceContext):
                 workflows_deployment,
                 self.prompts,
                 self.product_info,
+                dashboards=self._install_scope.dashboards if self._install_scope else None,
             )
             workspace_installation.run()
         except ManyError as err:
@@ -521,7 +568,7 @@ class WorkspaceInstaller(WorkspaceContext):
 
 
 class WorkspaceInstallation(InstallationMixin):
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         config: WorkspaceConfig,
         installation: Installation,
@@ -531,12 +578,15 @@ class WorkspaceInstallation(InstallationMixin):
         workflows_installer: WorkflowsDeployment,
         prompts: Prompts,
         product_info: ProductInfo,
+        *,
+        dashboards: frozenset[str] | None = None,
     ):
         self._config = config
         self._installation = installation
         self._install_state = install_state
         self._ws = ws
         self._sql_backend = sql_backend
+        self._dashboards = dashboards  # None deploys every dashboard
         self._workflows_installer = workflows_installer
         self._prompts = prompts
         self._product_info = product_info
@@ -594,6 +644,8 @@ class WorkspaceInstallation(InstallationMixin):
         logger.info(f"Installing UCX v{self._product_info.version()}")
         install_tasks = [self._create_database_and_dashboards, self._workflows_installer.create_jobs]
         Threads.strict("installing components", install_tasks)
+        # Only after both tasks: create_jobs() reads install_state.dashboards to render the README concurrently
+        self._remove_dashboards_outside_scope()
         readme_url = self._installation.workspace_link("README")
         if not self._is_account_install and self._prompts.confirm(f"Open job overview in your browser? {readme_url}"):
             webbrowser.open(readme_url)
@@ -607,6 +659,27 @@ class WorkspaceInstallation(InstallationMixin):
     def _create_database_and_dashboards(self) -> None:
         self._create_database()  # Need the database before creating the dashboards
         Threads.strict("installing dashboards", list(self._get_create_dashboard_tasks()))
+
+    def _remove_dashboards_outside_scope(self) -> None:
+        """Trash dashboards deployed by an earlier, unscoped install that fall outside the install scope."""
+        if self._dashboards is None:
+            return
+        keep = {dashboard.replace("/", "_").lower() for dashboard in self._dashboards}
+        for reference, dashboard_id in list(self._install_state.dashboards.items()):
+            if reference in keep:
+                continue
+            logger.info(f"Removing dashboard outside UCX_INSTALL_SCOPE: {reference} ({dashboard_id})")
+            try:
+                if self._is_redash_dashboard(dashboard_id):
+                    self._ws.dashboards.delete(dashboard_id=dashboard_id)
+                else:
+                    self._ws.lakeview.trash(dashboard_id)
+            except NotFound:
+                logger.info(f"Dashboard {reference} ({dashboard_id}) already removed")
+            except (BadRequest, PermissionDenied) as e:  # BadRequest covers InvalidParameterValue
+                # Best effort, like _upgrade_redash_dashboard: never fail an otherwise successful install
+                logger.warning(f"Cannot remove dashboard {reference} ({dashboard_id}), remove it manually: {e}")
+            del self._install_state.dashboards[reference]
 
     # InternalError are retried for resilience on sporadic Databricks issues
     @retried(on=[InternalError], timeout=timedelta(minutes=2))
@@ -650,6 +723,12 @@ class WorkspaceInstallation(InstallationMixin):
             logger.debug(f"Reading step folder {step_folder}...")
             for dashboard_folder in step_folder.iterdir():
                 if not dashboard_folder.is_dir():
+                    continue
+                if (
+                    self._dashboards is not None
+                    and f"{step_folder.name}/{dashboard_folder.name}" not in self._dashboards
+                ):
+                    logger.debug(f"Skipping dashboard {dashboard_folder} outside UCX_INSTALL_SCOPE")
                     continue
                 task = functools.partial(
                     self._create_dashboard,

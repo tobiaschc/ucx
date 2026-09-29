@@ -175,10 +175,29 @@ displayHTML(
 """
 
 
+class WorkflowNotDeployed(KeyError):
+    """Raised when a workflow is requested that is not deployed in this installation.
+
+    Subclasses KeyError so callers relying on the previous `install_state.jobs[step]` lookup behavior keep working.
+    """
+
+    def __str__(self) -> str:
+        return str(self.args[0])
+
+
 class DeployedWorkflows:
     def __init__(self, ws: WorkspaceClient, install_state: InstallState):
         self._ws = ws
         self._install_state = install_state
+
+    def _job_id(self, step: str) -> int:
+        job_id = self._install_state.jobs.get(step)
+        if job_id is None:
+            raise WorkflowNotDeployed(
+                f"Workflow '{step}' is not deployed in this installation. If UCX was installed with "
+                "UCX_INSTALL_SCOPE, reinstall without it to deploy all workflows."
+            )
+        return int(job_id)
 
     def run_workflow(
         self,
@@ -190,7 +209,7 @@ class DeployedWorkflows:
         # this dunder variable is hiding this method from tracebacks, making it cleaner
         # for the user to see the actual error without too much noise.
         __tracebackhide__ = True  # pylint: disable=unused-variable
-        job_id = int(self._install_state.jobs[step])
+        job_id = self._job_id(step)
         logger.debug(f"starting {step} job: {self._ws.config.host}#job/{job_id}")
         logger.info(f"Named parameters for {step} job: {named_parameters}")
         job_initial_run = self._ws.jobs.run_now(job_id, job_parameters=named_parameters)
@@ -308,7 +327,7 @@ class DeployedWorkflows:
         Returns :
             bool : True if step is validate. False otherwise.
         """
-        job_id = int(self._install_state.jobs[step])
+        job_id = self._job_id(step)
         logger.debug(f"Validating {step} workflow: {self._ws.config.host}#job/{job_id}")
         current_runs = list(self._ws.jobs.list_runs(completed_only=False, job_id=job_id))
         for run in current_runs:
